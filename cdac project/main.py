@@ -4,7 +4,57 @@ import unicodedata
 import ollama
 from langdetect import detect_langs
 from collections import OrderedDict
+from pydantic import BaseModel, Field, ValidationError, field_validator, AliasChoices
+from typing import List, Optional
 
+# --- PYDANTIC MODELS ---
+
+class NERData(BaseModel):
+    Person: List[str] = Field(default_factory=list)
+    Location: List[str] = Field(default_factory=list)
+    # Accepts both "Organisation" and "Organization" from the JSON
+    Organisation: List[str] = Field(
+        default_factory=list, 
+        validation_alias=AliasChoices('Organisation', 'Organization')
+    )
+    Event: List[str] = Field(default_factory=list)
+    Product: List[str] = Field(default_factory=list)
+
+class FactCheckerData(BaseModel):
+    relevant_topics: List[str] = Field(default_factory=list)
+    confidence_level: float = Field(default=0.0)
+    relevance_rating: str = Field(default="Low")
+
+class AnalysisResult(BaseModel):
+    domain_ident: List[str] = Field(default_factory=list)
+    domain_confidence: float = Field(default=0.0)
+    sentiment: str = Field(default="Neutral")
+    sentiment_confidence: float = Field(default=0.0)
+    NER: NERData = Field(default_factory=NERData)
+    ner_confidence: float = Field(default=0.0)
+    Event_calendar: List[str] = Field(default_factory=list)
+    event_calendar_confidence: float = Field(default=0.0)
+    Country_iden: str = Field(default="Unknown")
+    country_confidence: float = Field(default=0.0)
+    Fact_checker: FactCheckerData = Field(default_factory=FactCheckerData)
+    Summary: str = Field(default="")
+    summary_confidence: float = Field(default=0.0)
+
+    @field_validator('domain_confidence', 'sentiment_confidence', 'ner_confidence', 
+                     'event_calendar_confidence', 'country_confidence', 'summary_confidence', mode='before')
+    @classmethod
+    def normalize_confidence(cls, v):
+        """Ensures confidence scores are floats even if LLM returns strings."""
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return 0.0
+
+class TranslationResult(BaseModel):
+    translated_text: str
+    confidence: float = 0.0
+
+# --- EXISTING LOGIC ---
 
 class UnicodeScriptDetector:
     
@@ -159,29 +209,38 @@ class NLPOrchestrator:
         text = unicodedata.normalize("NFKC", text).translate(self.cleanup_trans)
         return self.space_re.sub(" ", text).strip()
     
-    def parsejson(self, response):
+    def parse_with_pydantic(self, response, pydantic_model):
+        """Helper to extract JSON and validate with Pydantic"""
         if not response:
             return None
         
+        # Pre-cleaning similar to your original logic
         response = response.replace(""", '"').replace(""", '"').replace("'", "'")
         response = self.trailing_comma_re.sub(r"\1", response)
         
+        json_str = None
         match = self.json_block_re.search(response)
+        
         if match:
-            try:
-                return json.loads(match.group(1))
-            except:
-                pass
+            json_str = match.group(1)
+        else:
+            # Fallback to finding { ... }
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start != -1 and end > start:
+                json_str = response[start:end]
         
-        start = response.find("{")
-        end = response.rfind("}") + 1
-        if start != -1 and end > start:
-            try:
-                return json.loads(response[start:end])
-            except:
-                pass
-        
-        return None
+        if not json_str:
+            return None
+
+        try:
+            # First load standard JSON
+            data = json.loads(json_str)
+            # Then validate with Pydantic
+            return pydantic_model(**data)
+        except (json.JSONDecodeError, ValidationError) as e:
+            # Optional: print(f"Validation Error: {e}") 
+            return None
     
     def llmdetectlanguage(self, text):
         prompt = f"""What language is this text written in?
@@ -261,17 +320,18 @@ Return ONLY: {{"translated_text": "...", "confidence": 0.0}}
 Text: {text}"""
         
         resp = self.callllm(prompt, max_tokens=200)
-        resp = resp.strip()
         
-        parsed = self.parsejson(resp)
+        # Use Pydantic model for parsing
+        result_model = self.parse_with_pydantic(resp, TranslationResult)
         
-        if parsed and "translated_text" in parsed:
-            translated = str(parsed["translated_text"]).strip()
-            conf = float(parsed.get("confidence", 0.88))
+        if result_model:
+            translated = result_model.translated_text
+            conf = result_model.confidence
             if conf == 0.0:
-                conf = 0.75
+                conf = 0.88
         else:
-            # Aggressive cleanup for artifacts
+            # Fallback cleanup logic
+            resp = resp.strip()
             for prefix in ['{"translated_text": "', '{ "translated_text": "', '"translated_text": ']:
                 if resp.startswith(prefix):
                     translated = resp[len(prefix):].rstrip('"}').strip()
@@ -284,7 +344,7 @@ Text: {text}"""
         return translated, conf
     
     def analyze(self, text):
-        prompt = f"""Analyze this text and return ONLY valid JSON — no markdown, no explanations, no extra text.
+        prompt = f"""Analyze this text and return ONLY valid JSON — no markdown, no explanations.
 
 {{
   "domain_ident": [],
@@ -303,41 +363,31 @@ Text: {text}"""
 }}
 
 STRICT RULES:
-- domain_ident: Choose ONLY ONE from this list — [Politics, Crime, Military, Terrorism, Radicalisation, Extremism in J&K, Law and Order, Narcotics, Left Wing Extremism, General]
-  - Use "Politics" ONLY if the main topic is elections, policy debates, political parties, government formation, or political rivalry.
-  - Use "Law and Order" for riots, protests, accidents, fires, disasters, public safety incidents, rescue operations.
-  - Use "General" for everyday news that doesn't fit above (most accidents/fires go here unless political angle dominates).
+- domain_ident: Choose ONLY ONE from: [Politics, Crime, Military, Terrorism, Radicalisation, Extremism in J&K, Law and Order, Narcotics, Left Wing Extremism, General]
+  - "Politics": ONLY for elections, political parties, government formation, parliament, or policy debates. (Do NOT use for business, product launches, or technology).
+  - "Law and Order": Riots, protests, accidents, fires, public safety.
+  - "General": Use this for EVERYTHING else, including: Technology (Smartphones, AI), Business, Sports, Entertainment, Lifestyle, and ordinary accidents.
 - sentiment: "Positive", "Negative", "Neutral", "Anti-National"
-  - Negative: deaths, destruction, suffering, tragedy, criticism of authorities, chaos
-  - Neutral: factual reporting without strong emotion
-  - Anti-National: ONLY direct threats/calls against India or its unity
 - NER: ONLY proper named entities
-  - Person: real individual names (e.g. "Arup Biswas")
-  - Location: specific places (e.g. "Nazirabad", "Anandpur")
-  - Organisation: named groups (e.g. "Fire Department", "West Bengal Government")
-  - Event: named events only (leave empty if none)
-  - Product: named products only (leave empty if none)
-- Summary: One single continuous sentence. High-level overview in your own words. Do NOT copy sentences from the text. Focus on what happened, who was affected, and outcome.
-- All confidence scores: 0.0-1.0 — be realistic, 0.9+ only for very clear cases
+  - Organisation: Government bodies, Companies (e.g. Samsung), Agencies (e.g. Police).
+  - Product: Specific product names (e.g. Galaxy A07, iPhone 15).
+- Summary: One single continuous sentence.
 
 Text:
 {text}"""
         
         max_tokens = min(300, 500 + len(text.split()) // 5)
         resp = self.callllm(prompt, max_tokens=max_tokens)
-        result = self.parsejson(resp)
+        
+        # Parse and validate with Pydantic
+        result = self.parse_with_pydantic(resp, AnalysisResult)
         
         if not result:
-            result = {
-                "domain_ident": ["General"], "domain_confidence": 0.3,
-                "sentiment": "Neutral", "sentiment_confidence": 0.3,
-                "NER": {"Person": [], "Location": [], "Organisation": [], "Event": [], "Product": []},
-                "ner_confidence": 0.0,
-                "Event_calendar": [], "event_calendar_confidence": 0.0,
-                "Country_iden": "Unknown", "country_confidence": 0.0,
-                "Fact_checker": {"relevant_topics": [], "confidence_level": 0.0, "relevance_rating": "Low"},
-                "Summary": "Analysis failed.", "summary_confidence": 0.0
-            }
+            result = AnalysisResult(
+                domain_ident=["General"],
+                domain_confidence=0.3,
+                Summary="Analysis failed."
+            )
         
         return result
     
@@ -362,51 +412,47 @@ Text:
             translated, trans_conf = self.translate(cleaned, lang_info["primary_lang"])
         
         print("Analyzing...")
+        # 'analysis' is now a Pydantic object, not a dict
         analysis = self.analyze(translated)
         
-        ner = analysis.get("NER", {})
+        # Accessing data via dot notation (safe and validated)
+        ner = analysis.NER
         ner_formatted = {
-            "Person": self.tostr(ner.get("Person", [])),
-            "Location": self.tostr(ner.get("Location", [])),
-            "Organisation": self.tostr(ner.get("Organisation", [])),
-            "Event": self.tostr(ner.get("Event", [])),
-            "Product": self.tostr(ner.get("Product", []))
+            "Person": self.tostr(ner.Person),
+            "Location": self.tostr(ner.Location),
+            "Organisation": self.tostr(ner.Organisation),
+            "Event": self.tostr(ner.Event),
+            "Product": self.tostr(ner.Product)
         }
         
-        fc = analysis.get("Fact_checker", {})
+        fc = analysis.Fact_checker
         
         return {
             "Cleaned_content": cleaned,
-            "domain_ident": self.tostr(analysis.get("domain_ident", [])),
-            "domain_ident_confidence_score": round(float(analysis.get("domain_confidence", 0.0)), 3),
+            "domain_ident": self.tostr(analysis.domain_ident),
+            "domain_ident_confidence_score": round(analysis.domain_confidence, 3),
             "lang_det": lang_info["primary_lang"],
             "lang_det_confidence_score": lang_info["confidence"],
-            "sentiment": analysis.get("sentiment", "Neutral"),
-            "sentiment_confidence_score": round(float(analysis.get("sentiment_confidence", 0.0)), 3),
+            "sentiment": analysis.sentiment,
+            "sentiment_confidence_score": round(analysis.sentiment_confidence, 3),
             "NER": ner_formatted,
-            "NER_confidence_score": round(float(analysis.get("ner_confidence", 0.0)), 3),
-            "Event_calender": self.tostr(analysis.get("Event_calendar", [])),
-            "Event_calender_confidence_score": round(float(analysis.get("event_calendar_confidence", 0.0)), 3),
-            "Country_iden": analysis.get("Country_iden", "Unknown"),
-            "Country_iden_confidence_score": round(float(analysis.get("country_confidence", 0.0)), 3),
-            "Summary": str(analysis.get("Summary", "")),
-            "Summary_confidence_score": round(float(analysis.get("summary_confidence", 0.0)), 3),
-            "Fact_checker": self.tostr(fc.get("relevant_topics", [])),
-            "Fact_checker_relevance_rating": fc.get("relevance_rating", "Low"),
-            "Fact_checker_confidence_score": round(float(fc.get("confidence_level", 0.0)), 3),
+            "NER_confidence_score": round(analysis.ner_confidence, 3),
+            "Event_calender": self.tostr(analysis.Event_calendar),
+            "Event_calender_confidence_score": round(analysis.event_calendar_confidence, 3),
+            "Country_iden": analysis.Country_iden,
+            "Country_iden_confidence_score": round(analysis.country_confidence, 3),
+            "Summary": analysis.Summary,
+            "Summary_confidence_score": round(analysis.summary_confidence, 3),
+            "Fact_checker": self.tostr(fc.relevant_topics),
+            "Fact_checker_relevance_rating": fc.relevance_rating,
+            "Fact_checker_confidence_score": round(fc.confidence_level, 3),
             "Translation": translated,
             "Translation_confidence_score": round(trans_conf, 3)
         }
 
 
 if __name__ == "__main__":
-    content = '''अग्निशमन दलानं आगीवर थोड्या प्रमाणात नियंत्रण मिळवल्यानंतर गॅस कटर घेत इमारतीत गेले. आनंदपूरच्या नाझिराबादमधील गोदामात प्रामुख्यानं कोरड्या स्वरुपाची खाद्य पदार्थाची पॅकेटस आणि सॉफ्ट ड्रिंक्सच्या बाटल्या होत्या. अग्निशमन दलाच्या माहितीनुसार आग दोन गोदामांमध्ये पसरली. यामुळं सर्व काही जळून खाक झालं. 
-
-अग्निशमन दलाला या आगीसंदर्भात माहिती मिळाली होती. मात्र, गोदाम अरुंद रस्ता असणाऱ्या ठिकाणी असल्यानं अग्निशमन दलाच्या वाहनांना घटनास्थळापर्यंत पोहोचण्यास अडचणी निर्माण झाल्या यामुळं आगीवर नियंत्रण आणण्यात वेळ लागला. 
-
-पश्चिम बंगालचे ऊर्जा मंत्री अरुप विश्वास घटनास्थळी दाखल झाले आणि त्यांनी मृतांच्या नातेवाईकांचं सांत्वन केलं.  याशिवाय त्यांच्याकडून बचाव कार्याचा आढावा घेण्यात आला. आगीच्या घटनेत ज्यांचे नातेवाईक बेपत्ता आहेत त्यांच्या नातेवाईकांसोबत अरुप विश्वास यांनी चर्चा केली. मंत्री अरुप विश्वास यांनी दिलेल्या माहितीनुसार पोलीस आणि अग्निशमन दलाकडून आगीवर नियंत्रण आणण्याचं काम सुरु आहे. आगीवर मोठ्या प्रमाणात नियंत्रण मिळवण्यात आल्याची माहिती देत फायर फायटर्स इमारतीत दाखल झाल्याची माहिती त्यांनी दिली. अरुप विश्वास यांनी ही राजकारण करण्याची वेळ नाही, पोलीस आणि अग्निशमन दलाला त्यांचं काम करु देण्याची वेळ असल्याचं म्हटलं. 
-
-गोदामात आग कशामुळं लागली हे स्पष्ट झालेलं नाही. रात्रीच्या ड्युटीवर असणारे कर्मचारी आत अडकले होते. याशिवाय सुरक्षा रक्षक म्हणून काम करणारे सहा लोक देखील आत अडकल्याची माहिती आहे. स्थानिकांच्या माहितीनुसार गोदाम बाहेरुन बंद होतं, त्यामुळं लोक आत जाऊ शकले नाहीत.'''
+    content = '''Samsung Galaxy A07 5G Smartphone : శాంసంగ్ గెలాక్సీ A07 4G స్మార్ట్‌ఫోన్‌ భారత్‌ మార్కెట్‌ లో ఇప్పటికే విడుదల అయింది. త్వరలో ఈ స్మార్ట్‌ఫోన్ 5G వేరియంట్‌ త్వరలో లాంచ్‌ కానుందని తెలుస్తోంది. అయితే గెలాక్సీ A07 5G స్మార్ట్‌ఫోన్‌ భారత్‌ లో విడుదలపై శాంసంగ్‌ ఎటువంటి ప్రకటన చేయలేదు. అయితే తాజాగా ఈ హ్యాండ్‌సెట్ గురించి అనేక వివరాలు లీక్‌ అయ్యాయి. కీలక వివరాలు లీక్‌ : గ్లోబల్‌ మార్కెట్‌ లో గెలాక్సీ A07 5G స్మార్ట్‌ఫోన్ ఇప్పటికే అందుబాటులో ఉంది. దీని ఆధారంగా భారత్‌ వేరియంట్‌ స్పెసిఫికేషన్‌లు, ఫీచర్లను కొంత వరకు అంచనా వేయవచ్చు. ఈ ఫోన్ ఇండియా వేరియంట్‌ 120Hz రీఫ్రెష్‌ రేట్‌ తో 6.7 అంగుళాల IPS LCD డిస్‌ప్లేను కలిగి ఉండే అవకాశం ఉంది.'''
     
     nlp = NLPOrchestrator()
     print("=" * 60)

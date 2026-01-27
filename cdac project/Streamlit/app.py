@@ -105,7 +105,7 @@ with st.sidebar:
         st.stop()
 
 # Main Content
-st.title("🧠 Local LLM Text Intelligence")
+st.title("🧠 NLP Text Intelligence")
 st.markdown("Upload a document or paste text to perform advanced NLP analysis using Llama 3.1.")
 
 st.markdown("<div class='block'>", unsafe_allow_html=True)
