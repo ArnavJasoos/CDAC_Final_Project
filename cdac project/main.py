@@ -7,12 +7,9 @@ from collections import OrderedDict
 from pydantic import BaseModel, Field, ValidationError, field_validator, AliasChoices
 from typing import List, Optional
 
-# --- PYDANTIC MODELS ---
-
 class NERData(BaseModel):
     Person: List[str] = Field(default_factory=list)
     Location: List[str] = Field(default_factory=list)
-    # Accepts both "Organisation" and "Organization" from the JSON
     Organisation: List[str] = Field(
         default_factory=list, 
         validation_alias=AliasChoices('Organisation', 'Organization')
@@ -214,7 +211,6 @@ class NLPOrchestrator:
         if not response:
             return None
         
-        # Pre-cleaning similar to your original logic
         response = response.replace(""", '"').replace(""", '"').replace("'", "'")
         response = self.trailing_comma_re.sub(r"\1", response)
         
@@ -224,7 +220,6 @@ class NLPOrchestrator:
         if match:
             json_str = match.group(1)
         else:
-            # Fallback to finding { ... }
             start = response.find("{")
             end = response.rfind("}") + 1
             if start != -1 and end > start:
@@ -234,12 +229,9 @@ class NLPOrchestrator:
             return None
 
         try:
-            # First load standard JSON
             data = json.loads(json_str)
-            # Then validate with Pydantic
             return pydantic_model(**data)
         except (json.JSONDecodeError, ValidationError) as e:
-            # Optional: print(f"Validation Error: {e}") 
             return None
     
     def llmdetectlanguage(self, text):
@@ -321,7 +313,6 @@ Text: {text}"""
         
         resp = self.callllm(prompt, max_tokens=200)
         
-        # Use Pydantic model for parsing
         result_model = self.parse_with_pydantic(resp, TranslationResult)
         
         if result_model:
@@ -330,7 +321,6 @@ Text: {text}"""
             if conf == 0.0:
                 conf = 0.88
         else:
-            # Fallback cleanup logic
             resp = resp.strip()
             for prefix in ['{"translated_text": "', '{ "translated_text": "', '"translated_text": ']:
                 if resp.startswith(prefix):
@@ -379,7 +369,6 @@ Text:
         max_tokens = min(300, 500 + len(text.split()) // 5)
         resp = self.callllm(prompt, max_tokens=max_tokens)
         
-        # Parse and validate with Pydantic
         result = self.parse_with_pydantic(resp, AnalysisResult)
         
         if not result:
@@ -412,10 +401,7 @@ Text:
             translated, trans_conf = self.translate(cleaned, lang_info["primary_lang"])
         
         print("Analyzing...")
-        # 'analysis' is now a Pydantic object, not a dict
         analysis = self.analyze(translated)
-        
-        # Accessing data via dot notation (safe and validated)
         ner = analysis.NER
         ner_formatted = {
             "Person": self.tostr(ner.Person),
