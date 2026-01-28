@@ -7,10 +7,8 @@ import pandas as pd
 import PyPDF2
 from io import BytesIO
 
-# Add parent directory to path to import main.py
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-# Import the NLP pipeline
 try:
     from main import NLPOrchestrator
 except ImportError:
@@ -23,7 +21,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for a premium look
 st.markdown("""
 <style>
 body { background-color: #0E1117; color: #FAFAFA; }
@@ -75,7 +72,6 @@ h1, h2, h3 { color: #E6E8EE; font-family: 'Inter', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
-# Cache the NLP model to avoid reloading
 @st.cache_resource
 def get_nlp_orchestrator():
     return NLPOrchestrator()
@@ -90,7 +86,6 @@ def extract_text_from_pdf(file_bytes):
     except Exception as e:
         return f"Error reading PDF: {str(e)}"
 
-# Sidebar
 with st.sidebar:
     st.title("⚙️ Settings")
     st.markdown("---")
@@ -104,7 +99,6 @@ with st.sidebar:
         st.error(f"Failed to load model: {e}")
         st.stop()
 
-# Main Content
 st.title("🧠 NLP Text Intelligence")
 st.markdown("Upload a document or paste text to perform advanced NLP analysis using Llama 3.1.")
 
@@ -152,12 +146,9 @@ if analyze_btn:
         st.markdown("<div class='block'>", unsafe_allow_html=True)
         try:
             with st.spinner("Running inference pipeline... this might take a moment"):
-                # Clear the LLM cache to ensure fresh results for new input
                 nlp._llm_cache.clear()
-                # Call the process method from NLPOrchestrator
                 result = nlp.process(input_text)
             
-            # Display Result
             st.success("Analysis Complete!")
             
             tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "📝 Clean & Translate", "🧾 Raw JSON"])
@@ -182,8 +173,6 @@ if analyze_btn:
                 else:
                     for label, values in ner.items():
                         if values:
-                             # values might be a comma separated string or list, main.py tostr makes it a string
-                             # Splitting by comma for display if it looks like a list
                             vals = [v.strip() for v in str(values).split(',')] if ',' in str(values) else [str(values)]
                             st.markdown(f"**{label}**")
                             for v in vals:
