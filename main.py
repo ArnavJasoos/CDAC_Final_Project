@@ -11,8 +11,8 @@ class NERData(BaseModel):
     Person: List[str] = Field(default_factory=list)
     Location: List[str] = Field(default_factory=list)
     Organisation: List[str] = Field(
-        default_factory=list, 
-        validation_alias=AliasChoices('Organisation', 'Organization')
+        default_factory = list, 
+        validation_alias = AliasChoices('Organisation', 'Organization')
     )
     Event: List[str] = Field(default_factory=list)
     Product: List[str] = Field(default_factory=list)
